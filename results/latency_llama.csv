@@ -1,0 +1,12 @@
+2025-06-11T17:52:41,llama,cuda,"meta-llama/Llama-3.2-3B_INT4_EO8 is not a local folder and is not a valid model identifier listed on 'https://huggingface.co/models'
+If this is a private repository, make sure to pass a token having permission to this repo either by logging in with `huggingface-cli login` or by passing `token=<your_token>`"
+2025-06-11T17:52:59,llama,cuda,"meta-llama/Llama-3.2-3B_INT4_EO8 is not a local folder and is not a valid model identifier listed on 'https://huggingface.co/models'
+If this is a private repository, make sure to pass a token having permission to this repo either by logging in with `huggingface-cli login` or by passing `token=<your_token>`"
+2025-06-11T17:53:25,llama,cuda,"meta-llama/Llama-3.2-3B_INT4_EO8 is not a local folder and is not a valid model identifier listed on 'https://huggingface.co/models'
+If this is a private repository, make sure to pass a token having permission to this repo either by logging in with `huggingface-cli login` or by passing `token=<your_token>`"
+2025-06-11T17:54:03,llama,cuda,"meta-llama/Llama-3.2-3B_INT4_EO8 is not a local folder and is not a valid model identifier listed on 'https://huggingface.co/models'
+If this is a private repository, make sure to pass a token having permission to this repo either by logging in with `huggingface-cli login` or by passing `token=<your_token>`"
+2025-06-11T17:55:06,llama,cuda,"There was a specific connection error when trying to load meta-llama/Llama-3.2-3B_INT4_EO8:
+401 Client Error: Unauthorized for url: https://huggingface.co/meta-llama/Llama-3.2-3B_INT4_EO8/resolve/main/config.json (Request ID: Root=1-6849446b-5b74fe9929326d37782930a0;08a0eafc-ece2-48d1-b025-469715f712ce)
+
+Invalid credentials in Authorization header"
