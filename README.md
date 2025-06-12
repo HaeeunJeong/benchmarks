@@ -14,10 +14,13 @@ benchmarks/
 │   └── stablehlo-iree.yaml         # Stand‑alone StableHLO → IREE toolchain
 ├── models/              # Lightweight model stubs (Conv, GAT …)
 │   ├── conv_block.py
-│   └── gat_block.py
+│   ├── gcn_block.py
+│   ├── graphsage_block.py
+│   ├── gat_block.py
+│   └── gatv2_block.py
 ├── scripts/             # All entry‑point helpers
 │   ├── run_bench.py     # Pure‑PyTorch latency probe
-│   └── compile_iree.py  # PyTorch → StableHLO → IREE runner
+│   └── compile_iree.py  # PyTorch → StableHLO → IREE runner /// Not Working Currently
 └── results/             # *.vmfb, *.csv outputs are dropped here
 ```
 
@@ -29,7 +32,7 @@ benchmarks/
 
 ```bash
 # clone your private repo
-$ git clone git@github.com:<you>/<repo>.git && cd <repo>/benchmarks
+$ git clone git@github.com:HaeeunJeong/benchmarks-for-my-compiler.git && cd benchmarks-for-my-compiler
 
 # conda (choose one of the YAML files)
 # CPU‑only example:
@@ -68,7 +71,10 @@ $ python -m scripts.run_bench resnet --device cuda
 | Category        | Key                 | Source                                                | Notes                                                                         |
 | --------------- | ------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------- |
 | Simple custom   | `conv`              | `models/conv_block.py`                                | 2×Conv + ReLU toy block used as a sanity‑check kernel                         |
+| **GNN**         | `gcn`\*             | `models/gcn_block.py`                                 | Graph Convolution Net                                                         |
+| **GNN**         | `graphsage`\*       | PyTorch Geometric                                     | Graph Sage Net; The milestone of GNN model                                    |
 | **GNN**         | `gat`\*             | PyTorch Geometric                                     | Graph Attention Net; contains `scatter_reduce`/`nonzero` (export‑unsupported) |
+| **GNN**         | `gatv2`\*           | PyTorch Geometric                                     | Graph Attention Net; contains `scatter_reduce`/`nonzero` (export‑unsupported) |
 | **CNN**         | `resnet`            | `torchvision` ResNet‑18                               | Classic image backbone; ImageNet pretrained                                   |
 | **CNN**         | `mobilenet`         | `torchvision` MobileNet v3 S                          | Mobile‑oriented CNN; ImageNet pretrained                                      |
 | **Transformer** | `vit`               | `torchvision` ViT‑B/16                                | Vision Transformer baseline                                                   |
