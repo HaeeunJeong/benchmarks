@@ -26,9 +26,9 @@ HF_MODELS: Dict[str, str] = {
     "bert":               "bert-base-uncased",
     "gpt2":               "gpt2-xl",
     # "llama":              "meta-llama/Meta-Llama-3-8B",
-    "llama":            "meta-llama/Llama-3.2-3B_INT4_EO8",
-    "llama-quant":      "meta-llama/Llama-3.2-3B-Instruct-SpinQuant_INT4_EO8",
-    "llama-qlora":      "meta-llama/Llama-3.2-3B-Instruct-QLORA_INT4_EO8",
+    "llama":            "meta-llama/Llama-3.2-3B",
+    # "llama-quant":      "meta-llama/Llama-3.2-3B-Instruct-SpinQuant_INT4_EO8",
+    # "llama-qlora":      "meta-llama/Llama-3.2-3B-Instruct-QLORA_INT4_EO8",
     "deepseek":         "deepseek-ai/deepseek-R1-Distill-Qwen-1.5B",
 }
 
@@ -38,7 +38,10 @@ TV_MODELS: Dict[str, Tuple[str, str, int]] = {
     "vit":        ("vit_b_16", "ViT_B_16", 224),
 }
 
-ALL_MODELS = ["conv", "gat"] + list(TV_MODELS.keys()) + list(HF_MODELS.keys())
+# GNN models
+GNN_KEYS = ["gcn", "graphsage", "gat", "gatv2"]
+
+ALL_MODELS = ["conv"] + GNN_KEYS + list(TV_MODELS.keys()) + list(HF_MODELS.keys())
 
 # Model Loader
 def load_model(name: str):
@@ -48,13 +51,21 @@ def load_model(name: str):
         mod = importlib.import_module("models.conv_block")
         return mod.ConvConvReLU(), VISION_INPUT_SHAPE
 
-    if name == "gat": # PyG (PyTorch Geometric)
-        mod = importlib.import_module("models.gat_block")
-        model = mod.GATBlock()
-        dummy_input = mod.get_dummy_input()
-        return model, dummy_input
+    if name == "gcn": # GNNs ------------- #
+        m = importlib.import_module("models.gcn_block")
+        return m.GCNBlock(), m.get_dummy_input()
+    if name == "graphsage":
+        m = importlib.import_module("models.graphsage_block")
+        return m.GraphSAGEBlock(), m.get_dummy_input()
+    if name == "gat":  
+        m = importlib.import_module("models.gat_block")
+        return m.GATBlock(), m.get_dummy_input()
+    if name == "gatv2":
+        m = importlib.import_module("models.gatv2_block")
+        return m.GATv2Block(), m.get_dummy_input()
 
-    if name in TV_MODELS: # torchvision models
+
+    if name in TV_MODELS: # Vision ------------- #
         fn_name, weight_name, _ = TV_MODELS[name]
         tv = importlib.import_module("torchvision.models")
         fn = getattr(tv, fn_name)
@@ -68,7 +79,7 @@ def load_model(name: str):
 
         return model, VISION_INPUT_SHAPE
 
-    if name in HF_MODELS: # Hugging Face models
+    if name in HF_MODELS: # GNNs ------------- #
         from transformers import AutoModel, AutoTokenizer
 
         tok = AutoTokenizer.from_pretrained(HF_MODELS[name])
@@ -120,7 +131,7 @@ def main():
     p.add_argument(
         "model", 
         nargs="*", 
-        help="Model(s) to run: conv | gat | resnet | mobilenet | vit | bert | gpt2 | llama | deepseek",
+        help=f"Models: {'|'.join(ALL_MODELS)}",
     )
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     p.add_argument("--csv", action="store_true", help="Save results to results/latency.csv")
@@ -141,12 +152,27 @@ def main():
             results.append((timestamp, model_name, args.device, str(e)))
 
     if args.csv:
-        out_path = Path(f"results/latency_{model_name}.csv")
+        # out_path = Path(f"results/latency_{model_name}.csv")
+        # out_path.parent.mkdir(exist_ok=True)
+        # with out_path.open("a", newline="") as f:
+        #     writer = csv.writer(f)
+        #     writer.writerows(results)
+        # print(f"[✓] Results saved to {out_path}")
+                # 1) 파일 이름: 단일 모델 vs ALL
+        tag = "all" if not args.model else "_".join(args.model)
+        out_path = Path(f"results/latency_{tag}.csv")
         out_path.parent.mkdir(exist_ok=True)
-        with out_path.open("a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerows(results)
-        print(f"[✓] Results saved to {out_path}")
+
+        # 2) 중복 방지: latency_all.csv, latency_all_1.csv, …
+        idx = 1
+        candidate = out_path
+        while candidate.exists():
+            candidate = out_path.with_stem(f"{out_path.stem}_{idx}")
+            idx += 1
+
+        with candidate.open("a", newline="") as f:
+            csv.writer(f).writerows(results)
+        print(f"[✓] Results saved to {candidate}")
 
 if __name__ == "__main__":
     main()

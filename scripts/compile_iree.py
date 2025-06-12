@@ -1,96 +1,122 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-compile_iree.py – PyTorch ➜ StableHLO ➜ IREE compile & run timer
-Python 3.11
-"""
-import argparse
-import time
-import tempfile
-from pathlib import Path
-from datetime import datetime
-import csv
+"""compile_iree.py – Compile supported PyTorch models to IREE vmfb & run.
 
+*   Exports model → StableHLO via `torch.export` + torch‑xla helper
+*   Compiles StableHLO → vmfb using the embedded `iree-compile` Python API
+*   Runs vmfb once on the requested HAL backend (llvm-cpu, cuda, …)
+*   Appends results to `results/iree_latency*.csv` (time | error | unsupported)
+
+Requires the `stablehlo-iree.yaml` (or *_gpu) env from /env to be activated.
+Python 3.11.  
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import time
+from datetime import datetime
+from pathlib import Path
+
+import torch
 from iree import runtime as ireert
 from iree.compiler import compile_str
 from torch_xla.stablehlo import exported_program_to_stablehlo
-import torch
 
-# run_bench.py 에서 공유한다고 가정
-from scripts.run_bench import load_model, ALL_MODELS
+# Re‑use model list / loader from run_bench
+from scripts.run_bench import load_model, ALL_MODELS, GNN_KEYS
 
-def pytorch_to_stablehlo(model, dummy):
+# ---------------------------------------------------------------------------
+# Configurable “unsupported” set – ops not yet captured by PyTorch → StableHLO
+# ---------------------------------------------------------------------------
+UNSUPPORTED: set[str] = {
+    # PyG scatters/nonzero currently not legalised for StableHLO
+    *GNN_KEYS,
+    # Large HF transformers need custom kwargs; skip by default
+    "bert", "gpt2", "llama", "deepseek",
+}
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def _to_stablehlo(model: torch.nn.Module, example) -> str:
+    """Return StableHLO MLIR string."""
     model.eval()
-    if isinstance(dummy, tuple):
-        exported = torch.export.export(model, (dummy[0], dummy[1])) if isinstance(dummy[0], torch.Tensor) else torch.export.export(model, (torch.randn(*dummy),))
+    if isinstance(example, tuple):
+        exported = torch.export.export(model, example)
     else:
-        exported = torch.export.export(model, (), kwargs=dummy)
-    hlo_obj = exported_program_to_stablehlo(exported)
-    # return hlo_obj.mlir_module_text
-    return str(hlo_obj)
+        exported = torch.export.export(model, (), kwargs=example)
+    shlo = exported_program_to_stablehlo(exported)
+    # `shlo.mlir_module` is an MLIR object; str() gives textual format
+    return str(shlo.mlir_module)
 
-def stablehlo_to_vmfb(mlir_txt, target):
-    flags = [
-        f"-iree-hal-target-backends={target}",
-        "--iree-stream-resource-index-bits=64",
-        "--iree-llvmcpu-target-triple=x86_64-unknown-linux-gnu",
-    ]
-    return compile_str(mlir_txt.encode("utf-8"), target_backends=target, extra_args=flags)
 
-def run_vmfb(vmfb_blob):
-    config = ireert.Config("local-task")
-    ctx = ireert.RuntimeContext(config)
-    mod = ireert.VmModule.from_flatbuffer(ctx.instance, vmfb_blob)
+def _compile_vmfb(hlo_text: str, target: str) -> bytes:
+    flags = [f"-iree-target-backends={target}", "--iree-stream-resource-index-bits=64"]
+    return compile_str(hlo_text, target_backends=target, extra_args=flags)
+
+
+def _run_vmfb(blob: bytes) -> float:
+    cfg = ireert.Config("local-task")
+    ctx = ireert.RuntimeContext(cfg)
+    mod = ireert.VmModule.from_flatbuffer(ctx.instance, blob)
     ctx.register_vm_module(mod)
     fn = ctx.modules.module["main"]
-    start = time.perf_counter()
-    _ = fn()
-    return (time.perf_counter() - start) * 1000  # ms
+    start = time.perf_counter(); fn(); return (time.perf_counter() - start) * 1000
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("model", nargs="*", help="Models to compile: conv | gat | resnet | mobilenet | vit | bert | gpt2 | llama | deepseek")
-    p.add_argument("--target", default="llvm-cpu", choices=["llvm-cpu", "cuda", "vulkan", "rocm"])
-    p.add_argument("--csv", action="store_true", help="Save results to results/iree_latency.csv")
-    args = p.parse_args()
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-    models_to_run = args.model if args.model else ALL_MODELS
-    results = []
-    timestamp = datetime.now().isoformat()
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("model", nargs="*", help="model keys (omit for ALL)")
+    ap.add_argument("--target", default="llvm-cpu", choices=["llvm-cpu", "cuda", "vulkan", "rocm"], help="IREE HAL back‑end")
+    ap.add_argument("--csv", action="store_true", help="save csv to results/")
+    args = ap.parse_args()
 
-    for model_name in models_to_run:
+    models: list[str] = args.model if args.model else ALL_MODELS
+    stamp = datetime.now().isoformat(timespec="seconds")
+    rows: list[list[str]] = []
+
+    for name in models:
+        if name in UNSUPPORTED:
+            print(f"[skip] {name}: unsupported")
+            rows.append([stamp, name, args.target, "unsupported"])
+            continue
         try:
-            print(f"\n[✓] Processing {model_name} → {args.target}")
-            model, dummy = load_model(model_name)
-
-            print(f"  ⤷ Exporting to StableHLO …")
-            hlo_txt = pytorch_to_stablehlo(model, dummy)
-
-            print(f"  ⤷ Compiling to IREE FlatBuffer …")
-            vmfb_blob = stablehlo_to_vmfb(hlo_txt, args.target)
-
-            print(f"  ⤷ Running on IREE runtime …")
-            ms = run_vmfb(vmfb_blob)
-            print(f"{model_name} on {args.target}: {ms:.2f} ms")
-
-            # Save vmfb file
-            out_path = Path("results") / f"{model_name}-{args.target}.vmfb"
-            out_path.parent.mkdir(exist_ok=True)
-            out_path.write_bytes(vmfb_blob)
-
-            results.append((timestamp, model_name, args.target, ms))
+            print(f"[{name}] export → compile → run …")
+            mdl, dummy = load_model(name)
+            hlo = _to_stablehlo(mdl, dummy)
+            vmfb = _compile_vmfb(hlo, args.target)
+            ms = _run_vmfb(vmfb)
+            print(f"✓ {name} : {ms:.2f} ms")
+            # save vmfb
+            Path("results").mkdir(exist_ok=True)
+            (Path("results") / f"{name}-{args.target}.vmfb").write_bytes(vmfb)
+            rows.append([stamp, name, args.target, f"{ms:.2f}"])
         except Exception as e:
-            print(f"[ERROR] {model_name}: {e}")
-            results.append((timestamp, model_name, args.target, "error"))
+            print(f"[ERROR] {name}: {e}")
+            rows.append([stamp, name, args.target, f"error: {e}"])
 
     if args.csv:
-        csv_path = Path("results/iree_latency.csv")
-        with csv_path.open("a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerows(results)
-        print(f"[✓] Results saved to {csv_path}")
+        tag = "all" if not args.model else "_".join(args.model)
+        out = Path(f"results/iree_latency_{tag}.csv")
+        out.parent.mkdir(exist_ok=True)
+        idx = 1
+        cand = out
+        while cand.exists():
+            cand = out.with_stem(f"{out.stem}_{idx}")
+            idx += 1
+        with cand.open("a", newline="") as f:
+            csv.writer(f).writerows(rows)
+        print(f"[✓] CSV appended → {cand}")
+
 
 if __name__ == "__main__":
     main()
+
+
 
 
