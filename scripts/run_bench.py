@@ -24,9 +24,9 @@ VISION_INPUT_SHAPE: Tuple[int, int, int, int] = (1, 3, 224, 224)  # (batch_size,
 
 HF_MODELS: Dict[str, str] = {
     "bert":               "bert-base-uncased",
-    "gpt2":               "gpt2-xl",
+    "gpt2":               "gpt2",
     # "llama":              "meta-llama/Meta-Llama-3-8B",
-    "llama":            "meta-llama/Llama-3.2-3B",
+    "llama":            "meta-llama/Llama-3.2-1B",
     # "llama-quant":      "meta-llama/Llama-3.2-3B-Instruct-SpinQuant_INT4_EO8",
     # "llama-qlora":      "meta-llama/Llama-3.2-3B-Instruct-QLORA_INT4_EO8",
     "deepseek":         "deepseek-ai/deepseek-R1-Distill-Qwen-1.5B",

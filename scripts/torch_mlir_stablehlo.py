@@ -47,17 +47,22 @@ def make_inputs(dummy: Any):
         return (dummy["input_ids"], dummy["attention_mask"])
     raise RuntimeError("Unsupported dummy spec")
 
-from torch_mlir.compiler_utils import PassManager as pm
 
-def postprocess(module):
-    run_pipeline_with_repro_report(
-        module, "torch-supress-runtime-asserts"
-    )
+# ---------------------------------------------------------------------------
+# post‑export clean‑ups (optional)
+# ---------------------------------------------------------------------------
+from torch_mlir.compiler_utils import run_pipeline_with_repro_report
 
+def postprocess(mod):
+        # ① assert·shape 계산 제거
     run_pipeline_with_repro_report(
-        module, "torch-split-large-constants"
+        mod,
+        "torch-drop-abstract-interp-calculations",
     )
-    return module
+    # ② canonicalize + stablehlo 정리 (상수 folding·중복 제거)
+    run_pipeline_with_repro_report(mod, "canonicalize", "canon")
+    run_pipeline_with_repro_report(mod, "stablehlo-aggressive-simplification", "shlo simp")
+    return mod
 
 # ---------------------------------------------------------------------------
 # main
