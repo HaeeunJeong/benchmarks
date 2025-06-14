@@ -1,122 +1,76 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-run_bench.py – PyTorch model loader + dummy run timer.
+run_bench.py – Universal PyTorch latency probe using model *block* modules.
 Python 3.11
 """
 
 from __future__ import annotations
 
 import argparse
-import time
-import importlib
 import csv
-
-from pathlib import Path
+import importlib
+import time
 from datetime import datetime
-from typing import Tuple, Dict, Any
+from pathlib import Path
+from typing import Any, Tuple
 
 import torch
 
-# Define common input shapes
-LLM_SEQ_LEN: int = 32
-VISION_INPUT_SHAPE: Tuple[int, int, int, int] = (1, 3, 224, 224)  # (batch_size, channels, height, width)
+# ---------------------------------------------------------------------------
+# 모델 key 목록 (block 파일 이름 prefix)
+# ---------------------------------------------------------------------------
+VISION_KEYS = ["conv", "resnet", "mobilenet", "vit"]
+GNN_KEYS    = ["gcn", "graphsage", "gat", "gatv2"]
+LLM_KEYS    = ["bert", "gpt2", "llama", "deepseek"]
+ALL_MODELS  = VISION_KEYS + GNN_KEYS + LLM_KEYS
 
-HF_MODELS: Dict[str, str] = {
-    "bert":               "bert-base-uncased",
-    "gpt2":               "gpt2",
-    # "llama":              "meta-llama/Meta-Llama-3-8B",
-    "llama":            "meta-llama/Llama-3.2-1B",
-    # "llama-quant":      "meta-llama/Llama-3.2-3B-Instruct-SpinQuant_INT4_EO8",
-    # "llama-qlora":      "meta-llama/Llama-3.2-3B-Instruct-QLORA_INT4_EO8",
-    "deepseek":         "deepseek-ai/deepseek-R1-Distill-Qwen-1.5B",
-}
-
-TV_MODELS: Dict[str, Tuple[str, str, int]] = {
-    "resnet":     ("resnet18", "ResNet18", 224),
-    "mobilenet":  ("mobilenet_v3_small", "MobileNet_V3_Small", 224),
-    "vit":        ("vit_b_16", "ViT_B_16", 224),
-}
-
-# GNN models
-GNN_KEYS = ["gcn", "graphsage", "gat", "gatv2"]
-
-ALL_MODELS = ["conv"] + GNN_KEYS + list(TV_MODELS.keys()) + list(HF_MODELS.keys())
-
-# Model Loader
+# ---------------------------------------------------------------------------
+# Model Loader – 모든 로직을 각 block 내부로 위임
+# ---------------------------------------------------------------------------
 def load_model(name: str):
+    """
+    Import `models/<name>_block.py` and return (model, dummy_input).
+
+    Each block **must** implement:
+        get_model()        -> torch.nn.Module (eval mode는 block 쪽 책임)
+        get_dummy_input()  -> Tensor | tuple[Tensor,...] | shape-tuple[int,...]
+    """
     name = name.lower()
-
-    if name == "conv": # Custom convolutional block
-        mod = importlib.import_module("models.conv_block")
-        return mod.ConvConvReLU(), VISION_INPUT_SHAPE
-
-    if name == "gcn": # GNNs ------------- #
-        m = importlib.import_module("models.gcn_block")
-        return m.GCNBlock(), m.get_dummy_input()
-    if name == "graphsage":
-        m = importlib.import_module("models.graphsage_block")
-        return m.GraphSAGEBlock(), m.get_dummy_input()
-    if name == "gat":  
-        m = importlib.import_module("models.gat_block")
-        return m.GATBlock(), m.get_dummy_input()
-    if name == "gatv2":
-        m = importlib.import_module("models.gatv2_block")
-        return m.GATv2Block(), m.get_dummy_input()
+    mod = importlib.import_module(f"models.{name}_block")
+    model = mod.get_model()
+    dummy = mod.get_dummy_input()
+    return model, dummy
 
 
-    if name in TV_MODELS: # Vision ------------- #
-        fn_name, weight_name, _ = TV_MODELS[name]
-        tv = importlib.import_module("torchvision.models")
-        fn = getattr(tv, fn_name)
-        weights_enum_name = weight_name + "_Weights"
-        try:
-            weights_enum = getattr(tv, weights_enum_name)
-            model = fn(weights=weights_enum.IMAGENET1K_V1)
-        except AttributeError:
-            # Fallback for older torchvision versions without weights enum
-            model = fn(pretrained=True)
-
-        return model, VISION_INPUT_SHAPE
-
-    if name in HF_MODELS: # GNNs ------------- #
-        from transformers import AutoModel, AutoTokenizer
-
-        tok = AutoTokenizer.from_pretrained(HF_MODELS[name])
-        mdl = AutoModel.from_pretrained(HF_MODELS[name])
-
-        vocab = getattr(tok, "vocab_size", 50257)  # Default for GPT-2
-        dummy_ids = torch.randint(0, vocab, (1, LLM_SEQ_LEN), dtype=torch.long)
-        dummy = {"input_ids": dummy_ids, "attention_mask": torch.ones_like(dummy_ids)}
-
-        return mdl, dummy
-
-    raise ValueError(f"Unknown model key: {name!r}")
-
-def time_forward(model: torch.nn.Module, dummy_input: Any, device: str ="cuda") -> float:
+# ---------------------------------------------------------------------------
+# Forward timer
+# ---------------------------------------------------------------------------
+def time_forward(model: torch.nn.Module, dummy_input: Any, device: str = "cuda") -> float:
     model = model.to(device)
 
+    # ------------------------- input to device -----------------------------
     if isinstance(dummy_input, tuple):
-        # Vision or GAT model
-        if len(dummy_input) == 2 and isinstance(dummy_input[0], torch.Tensor):
-            x, edge_index = dummy_input
-            x, edge_index = x.to(device), edge_index.to(device)
-            fn = lambda: model(x, edge_index)
+        # ➊ tuple of tensors → Vision(GNN/LLM) positional call
+        if all(isinstance(t, torch.Tensor) for t in dummy_input):
+            tensors = [t.to(device) for t in dummy_input]
+            fn = lambda: model(*tensors)
+        # ➋ tuple of ints → shape for random tensor (Conv / vision models)
         else:
             x = torch.randn(*dummy_input, device=device)
             fn = lambda: model(x)
-    else: # LLM Dictionary input
-        dummy_input = {k: v.to(device) for k, v in dummy_input.items()}
-        fn = lambda: model(**dummy_input)
+    else:
+        # Single tensor → just call
+        fn = lambda: model(dummy_input.to(device))
 
-    # ------- Warmup runs -------
+    # --------------------------- warm-up -----------------------------------
     for _ in range(5):
         with torch.no_grad():
             fn()
     if device.startswith("cuda"):
         torch.cuda.synchronize()
 
-    # ------- Timing run -------
+    # --------------------------- timing ------------------------------------
     start = time.perf_counter()
     with torch.no_grad():
         fn()
@@ -125,47 +79,39 @@ def time_forward(model: torch.nn.Module, dummy_input: Any, device: str ="cuda") 
 
     return (time.perf_counter() - start) * 1000.0  # ms
 
+
+# ---------------------------------------------------------------------------
 # CLI
+# ---------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument(
-        "model", 
-        nargs="*", 
-        help=f"Models: {'|'.join(ALL_MODELS)}",
-    )
+    p.add_argument("model", nargs="*", help=f"Models: {'|'.join(ALL_MODELS)}")
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
-    p.add_argument("--csv", action="store_true", help="Save results to results/latency.csv")
+    p.add_argument("--csv", action="store_true", help="Save results to results/latency_*.csv")
     args = p.parse_args()
 
     models_to_run = args.model if args.model else ALL_MODELS
     results = []
-    timestamp = datetime.now().isoformat(timespec='seconds')
+    timestamp = datetime.now().isoformat(timespec="seconds")
 
     for model_name in models_to_run:
         try:
             mdl, dummy = load_model(model_name)
             ms = time_forward(mdl, dummy, args.device)
-            print(f"{model_name:10s} | {args.device} | {ms:8.10f} ms")
-            results.append((timestamp, model_name, args.device, f"{ms:.10f} ms"))
+            print(f"{model_name:10s} | {args.device} | {ms:10.6f} ms")
+            results.append((timestamp, model_name, args.device, f"{ms:.6f}"))
         except Exception as e:
             print(f"[ERROR] {model_name}: {e}")
             results.append((timestamp, model_name, args.device, str(e)))
 
+    # --------------------------- CSV dump -----------------------------------
     if args.csv:
-        # out_path = Path(f"results/latency_{model_name}.csv")
-        # out_path.parent.mkdir(exist_ok=True)
-        # with out_path.open("a", newline="") as f:
-        #     writer = csv.writer(f)
-        #     writer.writerows(results)
-        # print(f"[✓] Results saved to {out_path}")
-                # 1) 파일 이름: 단일 모델 vs ALL
         tag = "all" if not args.model else "_".join(args.model)
         out_path = Path(f"results/latency_{tag}_{args.device}.csv")
         out_path.parent.mkdir(exist_ok=True)
 
-        # 2) 중복 방지: latency_all.csv, latency_all_1.csv, …
-        idx = 1
-        candidate = out_path
+        # avoid overwrite
+        idx, candidate = 1, out_path
         while candidate.exists():
             candidate = out_path.with_stem(f"{out_path.stem}_{idx}")
             idx += 1
@@ -173,6 +119,7 @@ def main():
         with candidate.open("a", newline="") as f:
             csv.writer(f).writerows(results)
         print(f"[✓] Results saved to {candidate}")
+
 
 if __name__ == "__main__":
     main()

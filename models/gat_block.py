@@ -1,4 +1,5 @@
-# Python 3.11
+from __future__ import annotations
+
 import torch
 from torch_geometric.nn.models import GAT
 import torch_geometric.utils as pyg_utils
@@ -17,6 +18,9 @@ class GATBlock(torch.nn.Module):
 
     def forward(self, x, edge_index):
         return self.model(x, edge_index)
+
+def get_model() -> torch.nn.Module:
+    return GATBlock()
 
 def get_dummy_input(num_nodes=100, in_channels=16):
     x = torch.randn((num_nodes, in_channels))

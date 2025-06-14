@@ -90,7 +90,7 @@ def main() -> None:
             shlo_mod = export_and_import(
                 mdl, *make_inputs(dummy), output_type=OutputType.STABLEHLO
             )
-            postprocess(shlo_mod)
+            # postprocess(shlo_mod)
 
             # print(shlo_mod)
 

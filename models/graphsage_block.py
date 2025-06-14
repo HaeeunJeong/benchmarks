@@ -19,6 +19,8 @@ class GraphSAGEBlock(torch.nn.Module):
         x = self.conv1(x, edge_index).relu()
         return self.conv2(x, edge_index)
 
+def get_model() -> torch.nn.Module:
+    return GraphSAGEBlock()
 
 def get_dummy_input(num_nodes: int = 100, in_ch: int = 16):
     torch.manual_seed(0)

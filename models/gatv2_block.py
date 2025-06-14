@@ -26,6 +26,9 @@ class GATv2Block(torch.nn.Module):
         return self.conv2(x, edge_index)
 
 
+def get_model() -> torch.nn.Module:
+    return GATv2Block()
+
 def get_dummy_input(num_nodes: int = 100, in_ch: int = 16):
     torch.manual_seed(0)
     x = torch.randn((num_nodes, in_ch))
