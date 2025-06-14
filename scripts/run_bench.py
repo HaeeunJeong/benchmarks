@@ -160,7 +160,7 @@ def main():
         # print(f"[✓] Results saved to {out_path}")
                 # 1) 파일 이름: 단일 모델 vs ALL
         tag = "all" if not args.model else "_".join(args.model)
-        out_path = Path(f"results/latency_{tag}.csv")
+        out_path = Path(f"results/latency_{tag}_{args.device}.csv")
         out_path.parent.mkdir(exist_ok=True)
 
         # 2) 중복 방지: latency_all.csv, latency_all_1.csv, …

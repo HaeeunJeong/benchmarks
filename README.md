@@ -8,20 +8,29 @@ A **reproducible micro‑benchmark suite** for testing how common PyTorch models
 
 ```text
 benchmarks/
-├── env/                 # Pre‑baked Conda env specs (pick one)
-│   ├── torch-stablehlo.yaml        # PyTorch + StableHLO (CPU)
-│   ├── torch-stablehlo-gpu.yaml    # PyTorch + StableHLO (CUDA)
-│   └── stablehlo-iree.yaml         # Stand‑alone StableHLO → IREE toolchain
-├── models/              # Lightweight model stubs (Conv, GAT …)
+├── env/                      # Pre‑baked Conda env specs (pick one)
+│   ├── torch-mlir/           # PyTorch to StableHLO through torch-mlir (for both CPU and CUDA)
+│   │   ├── environment.yaml
+│   │   └── requirements.txt
+│   ├── torch-xla/            # PyTorch to StableHLO through torch-xla (for CPU)
+│   │   ├── environment.yaml
+│   │   └── requirements.txt
+│   ├── stablehlo-iree/       # StableHLO to IREE
+│   │   ├── environment.yaml
+│   │   └── requirements.txt
+├── models/                   # Lightweight model stubs (Conv, GAT …)
 │   ├── conv_block.py
 │   ├── gcn_block.py
 │   ├── graphsage_block.py
 │   ├── gat_block.py
 │   └── gatv2_block.py
-├── scripts/             # All entry‑point helpers
-│   ├── run_bench.py     # Pure‑PyTorch latency probe
-│   └── compile_iree.py  # PyTorch → StableHLO → IREE runner /// Not Working Currently
-└── results/             # *.vmfb, *.csv outputs are dropped here
+├── scripts/                  # All entry‑point helpers
+│   ├── run_bench.py          # Pure‑PyTorch latency probe
+│   ├── run_bench_memgraph.py
+│   ├── torch_xla_stablehlo.py
+│   ├── torch_mlir_stablehlo.py
+│   └── compile_iree.py       # not working currently
+└── results/                  # *.vmfb, *.csv outputs are dropped here
 ```
 
 ---
@@ -32,34 +41,33 @@ benchmarks/
 
 ```bash
 # clone your private repo
-$ git clone git@github.com:HaeeunJeong/benchmarks-for-my-compiler.git && cd benchmarks-for-my-compiler
+git clone git@github.com:HaeeunJeong/benchmarks.git && cd benchmarks
 
-# conda (choose one of the YAML files)
-# CPU‑only example:
-$ conda env create -f env/torch-stablehlo.yaml -n pt-bench
-# CUDA  GPU example:
-# $ conda env create -f env/torch-stablehlo-gpu.yaml -n pt-bench
-$ conda activate pt-bench
+conda env create --file ./env/{target_env}/environment.yaml
+conda activate {target_env}
 ```
 
-<details>
-<summary>…or Docker</summary>
 
-```bash
-$ docker build -t pt-bench -f env/Dockerfile .
-$ docker run --gpus all -it pt-bench /bin/bash
-```
-
-</details>
 
 ### 2 · Run the plain PyTorch micro‑benchmarks
 
 ```bash
-# run all models on CPU
-$ python -m scripts.run_bench --device cpu --csv
+# Usage
+python -m scripts.run_bench {model} --device {cpu/cuda} --csv
 
-# a single model on GPU
-$ python -m scripts.run_bench resnet --device cuda
+# Ex. run all models on CPU
+python -m scripts.run_bench --device cpu --csv
+
+# Ex. single model on GPU
+python -m scripts.run_bench resnet --device cuda --csv
+```
+
+```bash
+# Convert PyTorch module into stablehlo through torch-xla
+$ python -m scripts.torch_xla_stablehlo
+
+# Convert PyTorch module into stablehlo through torch-mlir
+$ python -m scripts.torch_mlir_stablehlo
 ```
 
 *Outputs*: per‑model latency is printed and appended to `results/latency.csv` (timestamp, model, device, time / "error").
@@ -130,4 +138,5 @@ $ python -m scripts.compile_iree resnet mobilenet --target cuda
 ## 📜 License / visibility
 
 This is a **private** research benchmark. Do **NOT** publish benchmark numbers externally without permission.
+
 
