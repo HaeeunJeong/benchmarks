@@ -9,201 +9,143 @@ from __future__ import annotations
 import argparse, csv, importlib, os, time
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple, Dict, Any
+from typing import Any
 
 import torch
 import psutil
 
-# ---------- 그래프 그리기용 (선택) ----------
+# ─────────────────────────────────────────────────────────────────────────────
+# (선택) 그래프
+# ─────────────────────────────────────────────────────────────────────────────
 try:
     import matplotlib.pyplot as plt
 except ModuleNotFoundError:
-    plt = None  # --plot 옵션 사용 시 확인
+    plt = None  # --plot 옵션 사용 시만 필요
 
-# ---------- 공통 상수 ----------
-LLM_SEQ_LEN = 32
-VISION_INPUT_SHAPE = (1, 3, 224, 224)
+# ─────────────────────────────────────────────────────────────────────────────
+# 모델 key 목록  ➜  models/<name>_block.py 와 1:1 대응
+# ─────────────────────────────────────────────────────────────────────────────
+VISION_KEYS = ["conv", "resnet", "mobilenet", "vit"]
+GNN_KEYS    = ["gcn", "graphsage", "gat", "gatv2"]
+LLM_KEYS    = ["bert", "gpt2", "llama", "deepseek"]
+ALL_MODELS  = VISION_KEYS + GNN_KEYS + LLM_KEYS
 
-HF_MODELS: Dict[str, str] = {
-    "bert":         "bert-base-uncased",
-    "gpt2":         "gpt2-xl",
-    # "llama":      "meta-llama/Meta-Llama-3-8B",
-    "llama":        "meta-llama/Llama-3.2-3B",
-    "llama-quant":  "meta-llama/Llama-3.2-3B-Instruct-SpinQuant_INT4_EO8",
-    "llama-qlora":  "meta-llama/Llama-3.2-3B-Instruct-QLORA_INT4_EO8",
-    "deepseek":     "deepseek-ai/deepseek-R1-Distill-Qwen-1.5B",
-}
-TV_MODELS: Dict[str, Tuple[str, str, int]] = {
-    "resnet":    ("resnet18", "ResNet18", 224),
-    "mobilenet": ("mobilenet_v3_small", "MobileNet_V3_Small", 224),
-    "vit":       ("vit_b_16", "ViT_B_16", 224),
-}
-ALL_MODELS = ["conv", "gat"] + list(TV_MODELS.keys()) + list(HF_MODELS.keys())
-
-# ---------- 메모리 트래커 ----------
-def track_memory(pid: int, stop_flag: list[bool], interval: float = 0.05):
-    """백그라운드에서 RSS(MB) 시계열을 기록하고 리스트를 리턴."""
+# ─────────────────────────────────────────────────────────────────────────────
+# 메모리 트래커 (백그라운드)
+# ─────────────────────────────────────────────────────────────────────────────
+def track_memory(pid: int, stop: list[bool], interval: float = 0.05):
+    """RSS(MB) 시계열을 기록 – stop[0] 이 True 가 되면 종료."""
     proc = psutil.Process(pid)
-    mem_log: list[tuple[float, float]] = []
+    log: list[tuple[float, float]] = []
     t0 = time.perf_counter()
-    while not stop_flag[0]:
-        rss = proc.memory_info().rss / (1024**2)  # MB
-        mem_log.append((time.perf_counter() - t0, rss))
+    while not stop[0]:
+        rss = proc.memory_info().rss / (1024 ** 2)
+        log.append((time.perf_counter() - t0, rss))
         time.sleep(interval)
-    return mem_log
+    return log
 
-# ---------- 모델 로딩 (지면 관계상 이전 답변의 dtype/quant 지원 버전 재사용) ----------
+# ─────────────────────────────────────────────────────────────────────────────
+# 모델/더미 입력 로더 – **block module** 전용
+# ─────────────────────────────────────────────────────────────────────────────
+def load_model(name: str, device: str) -> tuple[torch.nn.Module, Any]:
+    """
+    models/<name>_block.py 를 import 후
+        get_model()        -> nn.Module
+        get_dummy_input()  -> (Tensor | tuple | shape-tuple)
+    반환.
+    """
+    mod = importlib.import_module(f"models.{name.lower()}_block")
+    model = mod.get_model().to(device)
+    dummy = mod.get_dummy_input()
+    return model, dummy
 
-def load_model(
-    name: str,
-    device: str,
-) -> Tuple[torch.nn.Module, Any]:
-    name = name.lower()
-
-    # (1) Conv 블록
-    if name == "conv":
-        mod = importlib.import_module("models.conv_block")
-        model = mod.ConvConvReLU().to(device=device)
-        return model, VISION_INPUT_SHAPE
-
-    # (2) GAT 블록
-    if name == "gat":
-        mod = importlib.import_module("models.gat_block")
-        model = mod.GATBlock().to(device=device)
-        dummy_input = mod.get_dummy_input()  # (x, edge_index)
-        return model, dummy_input
-
-    # (3) TorchVision
-    if name in TV_MODELS:
-        fn_name, *_ = TV_MODELS[name]
-        tv = importlib.import_module("torchvision.models")
-        fn = getattr(tv, fn_name)
-        model = fn(weights="DEFAULT" if "DEFAULT" in fn.__annotations__.get("weights", "") else None)
-        model = model.to(device=device)
-        return model, VISION_INPUT_SHAPE
-
-    # (4) Hugging Face LLM
-    if name in HF_MODELS:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from sentence_transformers import SentenceTransformer
-
-        kwargs = {
-            "device_map": "auto" if device == "cuda" else None,
-        }
-
-        tok = AutoTokenizer.from_pretrained(HF_MODELS[name], use_fast=False)
-        model = AutoModelForCausalLM.from_pretrained(
-            HF_MODELS[name], 
-            **kwargs, 
-            trust_remote_code=True)
-
-        vocab = tok.vocab_size
-        dummy_ids = torch.randint(0, vocab, (1, LLM_SEQ_LEN), device=device)
-        dummy = {"input_ids": dummy_ids, "attention_mask": torch.ones_like(dummy_ids)}
-
-        return model, dummy
-
-    raise ValueError(f"Unknown model key: {name!r}")
-
-# ---------- 추론 시간 측정 ----------
-def time_forward(model: torch.nn.Module, dummy_input: Any, device: str) -> float:
-    # 이미 올바른 device/dtype 으로 로드됨
-    if isinstance(dummy_input, tuple):
-        if len(dummy_input) == 2 and isinstance(dummy_input[0], torch.Tensor):
-            x, edge_index = dummy_input
-            x, edge_index = x.to(device), edge_index.to(device)
-            fn = lambda: model(x, edge_index)
+# ─────────────────────────────────────────────────────────────────────────────
+# 추론 1-step 시간(ms) 측정
+# ─────────────────────────────────────────────────────────────────────────────
+def time_forward(model: torch.nn.Module, dummy: Any, device: str) -> float:
+    if isinstance(dummy, tuple):
+        # (1) 모든 원소가 Tensor → positional 호출
+        if all(isinstance(t, torch.Tensor) for t in dummy):
+            tensors = [t.to(device) for t in dummy]
+            fn = lambda: model(*tensors)
+        # (2) Vision 등 shape-tuple → 난수 Tensor 생성
         else:
-            x = torch.randn(*dummy_input, device=device)
+            x = torch.randn(*dummy, device=device)
             fn = lambda: model(x)
-    else:
-        dummy_input = {k: v.to(device) for k, v in dummy_input.items()}
-        fn = lambda: model(**dummy_input)
+    else:  # 단일 Tensor
+        fn = lambda: model(dummy.to(device))
 
-    # 워밍업
+    # Warm-up
     for _ in range(5):
-        with torch.no_grad():
-            fn()
-    if device.startswith("cuda"):
-        torch.cuda.synchronize()
+        with torch.no_grad(): fn()
+    if device.startswith("cuda"): torch.cuda.synchronize()
 
+    # Timed run
     start = time.perf_counter()
-    with torch.no_grad():
-        fn()
-    if device.startswith("cuda"):
-        torch.cuda.synchronize()
+    with torch.no_grad(): fn()
+    if device.startswith("cuda"): torch.cuda.synchronize()
 
-    return (time.perf_counter() - start) * 1000.0  # ms
+    return (time.perf_counter() - start) * 1000.0  # → ms
 
-
-# ---------- CLI ----------
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("model", nargs="*", help="model name (conv, gat, resnet, mobilenet, vit, bert, gpt2, llama, llama-quant, llama-qlora, deepseek)")
-    p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
-    p.add_argument("--track-mem", action="store_true", help="RSS 추적")
-    p.add_argument("--plot", action="store_true", help="추적 시 그래프 png 저장/보기")
-    p.add_argument("--csv", action="store_true")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("model", nargs="*", help=f"model name ({'|'.join(ALL_MODELS)})")
+    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    ap.add_argument("--track-mem", action="store_true", help="RSS 추적")
+    ap.add_argument("--plot", action="store_true", help="추적 시 그래프 저장")
+    ap.add_argument("--csv", action="store_true", help="results/latency.csv 갱신")
+    args = ap.parse_args()
 
-    models_to_run = args.model or ALL_MODELS
+    models = args.model or ALL_MODELS
     timestamp = datetime.now().isoformat(timespec="seconds")
-    results = []
+    results: list[tuple[str, str, str, str, str]] = []
 
-    for m in models_to_run:
+    for name in models:
         try:
-            mdl, dummy = load_model(m, args.device)
+            mdl, dummy = load_model(name, args.device)
 
-            # ===== 메모리 백그라운드 스레드 시작 =====
-            stop_flag = [False]
-            mem_log = []
+            # ── 메모리 추적 스레드 시작
+            stop = [False]; mem_log = []
             if args.track_mem:
                 from threading import Thread
-                th = Thread(target=lambda: mem_log.extend(track_memory(os.getpid(), stop_flag)), daemon=True)
-                th.start()
+                t = Thread(target=lambda: mem_log.extend(track_memory(os.getpid(), stop)), daemon=True)
+                t.start()
 
             ms = time_forward(mdl, dummy, args.device)
 
-            # ===== 메모리 트래커 종료 =====
+            # ── 메모리 추적 종료
+            peak_mb = "NA"
             if args.track_mem:
-                stop_flag[0] = True
-                th.join()
-                peak_mb = max(r[1] for r in mem_log)
-            else:
-                peak_mb = "NA"
+                stop[0] = True; t.join()
+                peak_mb = f"{max(r[1] for r in mem_log):.1f}"
 
-            print(f"{m:10s} | {args.device}"
-                  f"| {ms:8.2f} ms | peak {peak_mb} MB")
-            results.append((timestamp, m, args.device, f"{ms:.2f}", peak_mb))
+            print(f"{name:10s}| {args.device} | {ms:8.2f} ms | peak {peak_mb} MB")
+            results.append((timestamp, name, args.device, f"{ms:.2f}", peak_mb))
 
-            # -------- 그래프 ----------
-            if args.track_mem and args.plot:
-                if plt is None:
-                    print("[WARN] matplotlib 미설치 – 그래프 생략")
-                else:
-                    t, mb = zip(*mem_log)
-                    plt.figure(figsize=(6, 3))
-                    plt.plot(t, mb)
-                    plt.xlabel("time (s)")
-                    plt.ylabel("RSS (MB)")
-                    plt.title(f"{m} CPU Memory Usage")
-                    out_png = Path(f"results/mem_{m}.png")
-                    out_png.parent.mkdir(exist_ok=True)
-                    plt.savefig(out_png, dpi=120, bbox_inches="tight")
-                    plt.close()
-                    print(f"[✓] 그래프 저장: {out_png}")
+            # ── 그래프 저장
+            if args.track_mem and args.plot and plt is not None:
+                tt, mb = zip(*mem_log)
+                plt.figure(figsize=(6, 3))
+                plt.plot(tt, mb)
+                plt.xlabel("time (s)"); plt.ylabel("RSS (MB)")
+                plt.title(f"{name} CPU Memory Usage")
+                out_png = Path(f"results/mem_{name}.png"); out_png.parent.mkdir(exist_ok=True)
+                plt.savefig(out_png, dpi=120, bbox_inches="tight"); plt.close()
+                print(f"[✓] 그래프 저장: {out_png}")
 
         except Exception as e:
-            print(f"[ERROR] {m}: {e}")
-            results.append((timestamp, m, args.device, f"ERROR: {e}", "NA"))
+            print(f"[ERROR] {name}: {e}")
+            results.append((timestamp, name, args.device, f"ERROR: {e}", "NA"))
 
-    # CSV 저장
+    # ── CSV
     if args.csv:
-        out_path = Path("results/latency.csv")
-        out_path.parent.mkdir(exist_ok=True)
-        with out_path.open("a", newline="") as f:
+        out = Path("results/latency.csv"); out.parent.mkdir(exist_ok=True)
+        with out.open("a", newline="") as f:
             csv.writer(f).writerows(results)
-        print(f"[✓] Results saved to {out_path}")
+        print(f"[✓] Results saved to {out}")
 
 if __name__ == "__main__":
     main()

@@ -1,122 +1,164 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""compile_iree.py – Compile supported PyTorch models to IREE vmfb & run.
+"""iree_run.py – Compile models/* blocks to IREE vmfb (weights externalized).
 
-*   Exports model → StableHLO via `torch.export` + torch‑xla helper
-*   Compiles StableHLO → vmfb using the embedded `iree-compile` Python API
-*   Runs vmfb once on the requested HAL backend (llvm-cpu, cuda, …)
-*   Appends results to `results/iree_latency*.csv` (time | error | unsupported)
-
-Requires the `stablehlo-iree.yaml` (or *_gpu) env from /env to be activated.
-Python 3.11.  
+* 파라미터는 `.safetensors` 로 저장하고, IR에는 `dense_resource` 참조만 남김.
+* vmfb 실행 시 `iree.runtime.ParameterIndex` 로 메모리 상에 가중치를 주입.
+* 결과 artefacts (예: conv):
+    results/iree/conv/
+      ├─ module.vmfb            (compiled binary)
+      ├─ params.safetensors     (weights)
+      ├─ input.npy              (샘플 입력, 재현용)
+      └─ latency.txt            (1‑shot ms)
 """
 from __future__ import annotations
 
-import argparse
-import csv
-import time
+import argparse, csv, os, time
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict
 
 import torch
-from iree import runtime as ireert
-from iree.compiler import compile_str
-from torch_xla.stablehlo import exported_program_to_stablehlo
+import numpy as np
+from safetensors.torch import save_file
 
-# Re‑use model list / loader from run_bench
-from scripts.run_bench import load_model, ALL_MODELS, GNN_KEYS
+import iree.turbine.aot as aot
+import iree.runtime as ireert
+import iree.runtime as rt
 
-# ---------------------------------------------------------------------------
-# Configurable “unsupported” set – ops not yet captured by PyTorch → StableHLO
-# ---------------------------------------------------------------------------
-UNSUPPORTED: set[str] = {
-    # PyG scatters/nonzero currently not legalised for StableHLO
-    *GNN_KEYS,
-    # Large HF transformers need custom kwargs; skip by default
-    "bert", "gpt2", "llama", "deepseek",
-}
+from scripts.run_bench import load_model, ALL_MODELS
 
 # ---------------------------------------------------------------------------
-# Helper functions
+# helpers
 # ---------------------------------------------------------------------------
 
-def _to_stablehlo(model: torch.nn.Module, example) -> str:
-    """Return StableHLO MLIR string."""
-    model.eval()
-    if isinstance(example, tuple):
-        exported = torch.export.export(model, example)
-    else:
-        exported = torch.export.export(model, (), kwargs=example)
-    shlo = exported_program_to_stablehlo(exported)
-    # `shlo.mlir_module` is an MLIR object; str() gives textual format
-    return str(shlo.mlir_module)
+def make_inputs(dummy: Any):
+    if isinstance(dummy, tuple):
+        if len(dummy) == 2 and isinstance(dummy[0], torch.Tensor):
+            return dummy  # (x, edge_index)
+        return (torch.randn(*dummy),)
+    if isinstance(dummy, dict):
+        return (dummy["input_ids"], dummy["attention_mask"])
+    return (dummy,)
 
 
-def _compile_vmfb(hlo_text: str, target: str) -> bytes:
-    flags = [f"-iree-target-backends={target}", "--iree-stream-resource-index-bits=64"]
-    return compile_str(hlo_text, target_backends=target, extra_args=flags)
+# def export_and_externalize(model: torch.nn.Module, inputs):
+#     weights: Dict[str, torch.Tensor] = {n: p.detach().contiguous() for n, p in model.named_parameters()}
+#     aot.externalize_module_parameters(model)
+#     exported = aot.export(model, *inputs)
+#     return exported, weights
+
+def export_and_externalize(model: torch.nn.Module, inputs):
+    # 1) 모든 파라미터 + 버퍼를 dict 에 복사
+    # weights = {n: p.detach().contiguous()
+    #            for n, p in model.named_parameters()}
+    # buffers = {n: b.detach().contiguous()
+    #            for n, b in model.named_buffers()}
+    # weights.update(buffers)                # <-- BN running_mean/var 포함
+
+    weights = {n: p.detach().contiguous() for n, p in model.named_parameters()}
+    for n, b in model.named_buffers():
+        if not b.requires_grad:        # 모든 buffer
+            weights[n] = b.detach().contiguous()
+
+    # 2) 외부화
+    aot.externalize_module_parameters(model)
+    exported = aot.export(model, *inputs)
+    return exported, weights
 
 
-def _run_vmfb(blob: bytes) -> float:
-    cfg = ireert.Config("local-task")
-    ctx = ireert.RuntimeContext(cfg)
-    mod = ireert.VmModule.from_flatbuffer(ctx.instance, blob)
-    ctx.register_vm_module(mod)
-    fn = ctx.modules.module["main"]
-    start = time.perf_counter(); fn(); return (time.perf_counter() - start) * 1000
+def save_weights_safetensor(weights: Dict[str, torch.Tensor], path: Path):
+    save_file(weights, str(path))
+
 
 # ---------------------------------------------------------------------------
-# CLI
+# IREE run helpers
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def run_vmfb(vmfb_mm, backend: str, inputs, weights: Dict[str, torch.Tensor]):
+    """vmfb_mm: MappedMemory from exported.compile()"""
+    drv_map = rt.TARGET_BACKEND_TO_DRIVER
+    driver = backend if backend in rt.query_available_drivers() else drv_map.get(backend, "llvm")
+
+    # Build ParameterIndex (in‑memory buffers)
+    idx = ireert.ParameterIndex()
+    for k, t in weights.items():
+        idx.add_buffer(k, t.numpy().tobytes())
+
+    cfg = ireert.Config(driver_name=driver)
+    inst = cfg.vm_instance
+
+    param_module = ireert.create_io_parameters_module(inst, idx.create_provider(scope="model"))
+    hal_module = ireert.create_hal_module(inst, cfg.device)
+    main_module = ireert.VmModule.copy_buffer(inst, vmfb_mm.map_memory())
+
+    modules = ireert.load_vm_modules(param_module, hal_module, main_module, config=cfg)
+    vm = modules[-1]
+
+    np_inputs = [t.detach().cpu().numpy() for t in inputs]
+    res = vm.main(*np_inputs)
+    if hasattr(res, "to_host"):
+        return res.to_host()
+    return res
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("model", nargs="*", help="model keys (omit for ALL)")
-    ap.add_argument("--target", default="llvm-cpu", choices=["llvm-cpu", "cuda", "vulkan", "rocm"], help="IREE HAL back‑end")
-    ap.add_argument("--csv", action="store_true", help="save csv to results/")
+    ap.add_argument("model", nargs="*", help="block keys; omit=all")
+    ap.add_argument("--backend", default="llvm-cpu", choices=["llvm-cpu", "cuda", "vulkan", "rocm"])
+    ap.add_argument("--csv", action="store_true")
+    ap.add_argument("--mode", default="aot", choices=["aot", "jit"],
+               help="aot: externalize weights (default) | jit: embed weights")
     args = ap.parse_args()
 
-    models: list[str] = args.model if args.model else ALL_MODELS
-    stamp = datetime.now().isoformat(timespec="seconds")
-    rows: list[list[str]] = []
+    models = args.model if args.model else ALL_MODELS
+    base_dir = Path("results/iree"); base_dir.mkdir(exist_ok=True)
+
+    rows = []; ts = datetime.now().isoformat(timespec="seconds")
 
     for name in models:
-        if name in UNSUPPORTED:
-            print(f"[skip] {name}: unsupported")
-            rows.append([stamp, name, args.target, "unsupported"])
-            continue
         try:
             print(f"[{name}] export → compile → run …")
-            mdl, dummy = load_model(name)
-            hlo = _to_stablehlo(mdl, dummy)
-            vmfb = _compile_vmfb(hlo, args.target)
-            ms = _run_vmfb(vmfb)
-            print(f"✓ {name} : {ms:.2f} ms")
-            # save vmfb
-            Path("results").mkdir(exist_ok=True)
-            (Path("results") / f"{name}-{args.target}.vmfb").write_bytes(vmfb)
-            rows.append([stamp, name, args.target, f"{ms:.2f}"])
+            mdl, dummy = load_model(name); mdl.eval()
+            inp = make_inputs(dummy)
+
+            if args.mode == "aot":
+                exported, weight_dict = export_and_externalize(mdl, inp)
+            else: # args.mode == "jit"
+                exported = aot.export(mdl, *inp)
+                weight_dict = {}
+
+            mdl_dir = base_dir / name; mdl_dir.mkdir(exist_ok=True)
+            # safepath = mdl_dir / "params.safetensors"; save_weights_safetensor(weight_dict, safepath)
+            np.save(mdl_dir / "input.npy", inp[0].detach().cpu().numpy())
+            print(f"  ✓ exported {name} with {len(weight_dict)} weights")
+
+            # vmfb_mm_for_save = exported.compile(save_to=f"{mdl_dir}/{name}-{args.backend}.vmfb", target_backends=[args.backend])
+            vmfb_mm = exported.compile(save_to=None, target_backends=[args.backend])
+            # print(f"  ✓ saved weights to {safepath}")
+
+            st = time.perf_counter(); run_vmfb(vmfb_mm, args.backend, inp, weight_dict); lat = (time.perf_counter()-st)*1000
+            (mdl_dir / "latency.txt").write_text(f"{lat:.3f} ms\n")
+            print(f"  ✓ {lat:.3f} ms  → {mdl_dir}")
+            rows.append([ts, name, args.backend, f"{lat:.3f}"])
         except Exception as e:
-            print(f"[ERROR] {name}: {e}")
-            rows.append([stamp, name, args.target, f"error: {e}"])
+            reason = str(e).splitlines()[0]
+            print(f"  [ERROR] {name}: {reason}")
+            rows.append([ts, name, args.backend, f"error: {reason}"])
 
     if args.csv:
         tag = "all" if not args.model else "_".join(args.model)
-        out = Path(f"results/iree_latency_{tag}.csv")
-        out.parent.mkdir(exist_ok=True)
-        idx = 1
-        cand = out
-        while cand.exists():
-            cand = out.with_stem(f"{out.stem}_{idx}")
-            idx += 1
-        with cand.open("a", newline="") as f:
+        csv_p = base_dir / f"iree_latency_{tag}_{args.backend}.csv"
+        with csv_p.open("a", newline="") as f:
             csv.writer(f).writerows(rows)
-        print(f"[✓] CSV appended → {cand}")
+        print(f"[✓] CSV → {csv_p}")
 
 
 if __name__ == "__main__":
+    os.environ.setdefault("PJRT_DEVICE", "")  # mute torch_xla PJRT warning
     main()
-
-
-
 

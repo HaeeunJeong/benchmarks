@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-export_torch_xla_stablehlo.py
+export_torch_mlir_stablehlo.py
 ──────────────────────────────────────────────────────────────────────────────
-PyTorch  →  StableHLO  via torch-xla (exported_program_to_stablehlo).
+PyTorch  →  StableHLO  via torch-mlir.fx.export_and_import (OutputType.STABLEHLO)
 
-* 모델을 주지 않으면 models/ 디렉터리의 모든 *_block.py 를 자동 탐색합니다.
-* 성공 :  results/xla/<name>_stablehlo/   디렉터리(MLIR+weights) 저장
-* 실패 :  STDOUT + CSV(results/xla_export_log.csv) 기록
+* 모델은 모두 models/<name>_block.py 의
+    get_model(), get_dummy_input()  래퍼로 로드한다.
+* 이름을 주지 않으면 models/ 하위 모든 *_block.py 를 자동 탐색한다.
+* 성공 시  results/<name>_stablehlo.torch_mlir.mlir  저장
+  (텍스트 MLIR, weights 내장 아님).
+* 실패 시 첫 줄 오류를 STDOUT  +  CSV(results/torch_mlir_log.csv) 기록
 """
 from __future__ import annotations
 
@@ -17,13 +20,21 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import torch
-from torch_xla.stablehlo import exported_program_to_stablehlo
-
-# PJRT 디바이스 워닝 억제 (빈 문자열 = 런타임 default)
-os.environ.setdefault("PJRT_DEVICE", "")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 모델 블록 로딩
+# torch-mlir  체크
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    from torch_mlir.fx import export_and_import
+    from torch_mlir.compiler_utils import OutputType
+except ImportError as e:  # pragma: no cover
+    sys.exit(
+        "[ERROR] torch-mlir 2024+ 가 필요합니다. "
+        "`pip install torch-mlir-nightly` 로 설치 후 다시 실행하세요."
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 모델 블록 로더
 # ─────────────────────────────────────────────────────────────────────────────
 MODELS_DIR = Path(__file__).parent.parent / "models"
 
@@ -37,8 +48,7 @@ def discover_model_keys() -> list[str]:
 
 def load_model_block(name: str, device: str = "cpu") -> tuple[torch.nn.Module, Any]:
     """
-    import models/<name>_block.py  →
-        get_model(), get_dummy_input()
+    models/<name>_block.py  import  →  get_model(), get_dummy_input()
     """
     mod = importlib.import_module(f"models.{name}_block")
     model = mod.get_model().to(device).eval()
@@ -46,9 +56,9 @@ def load_model_block(name: str, device: str = "cpu") -> tuple[torch.nn.Module, A
     return model, dummy
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 입력 구성 & HF 래퍼
+# 입력 변환 (tuple / dict → positional)
 # ─────────────────────────────────────────────────────────────────────────────
-class HFWrapper(torch.nn.Module):
+class HFPosWrapper(torch.nn.Module):
     """kwargs(HF) → forward(ids, mask)"""
     def __init__(self, m: torch.nn.Module):
         super().__init__(); self.m = m
@@ -56,58 +66,60 @@ class HFWrapper(torch.nn.Module):
         return self.m(input_ids=ids, attention_mask=mask).last_hidden_state
 
 def make_inputs(dummy: Any) -> tuple:
-    """dummy 사양을 torch.export 가 받을 *args 로 변환"""
+    """전달받은 dummy 를 torch-mlir export 에 넣을 *args 형태로 변환"""
     if isinstance(dummy, tuple):
-        # (Tensor, Tensor) = GNN  vs  shape-tuple = Vision
-        if len(dummy) == 2 and all(isinstance(t, torch.Tensor) for t in dummy):
+        # (Tensor, Tensor) = GNN  vs  (int,int,…) shape = Vision
+        if len(dummy) == 2 and isinstance(dummy[0], torch.Tensor):
             return dummy
         return (torch.randn(*dummy),)
-    if isinstance(dummy, dict):          # LLM dict
+    if isinstance(dummy, dict):  # LLM dict
         return (dummy["input_ids"], dummy["attention_mask"])
-    raise RuntimeError(f"Unsupported dummy type: {type(dummy)}")
+    raise RuntimeError(f"Unsupported dummy spec: {type(dummy)}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # main
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("model", nargs="*", help="model keys; omit = all discovered")
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
-    ap.add_argument("--outdir", default="results/xla", help="output directory")
+    ap.add_argument("--outdir", default="results/torch-mlir", help="save dir")
     ap.add_argument("--csv", action="store_true", help="append csv log")
     args = ap.parse_args()
 
-    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
+    outdir = Path(args.outdir); outdir.mkdir(exist_ok=True)
     keys: Iterable[str] = args.model or discover_model_keys()
     timestamp = datetime.now().isoformat(timespec="seconds")
     rows: list[list[str]] = []
 
     for name in keys:
         try:
-            print(f"[{name}] torch_xla → StableHLO export …")
+            print(f"[{name}] torch-mlir export …")
             model, dummy = load_model_block(name, args.device)
 
-            # HF 모델이면 kwargs → positional 래퍼
+            # HF LLM 은 kwargs → positional 래핑
             if isinstance(dummy, dict):
-                model = HFWrapper(model)
+                model = HFPosWrapper(model)
 
-            ep = torch.export.export(model, make_inputs(dummy))
-            shlo = exported_program_to_stablehlo(ep)
+            shlo_module = export_and_import(
+                model, *make_inputs(dummy), output_type=OutputType.STABLEHLO
+            )
 
-            dest = outdir / f"{name}_stablehlo"
-            shlo.save(dest)  # 디렉터리 생성 & MLIR/weights 저장
-            print(f"   ✓ saved → {dest}")
+            out_path = outdir / f"{name}_stablehlo.torch_mlir.mlir"
+            out_path.write_text(str(shlo_module))
+            print(f"   ✓ saved → {out_path}")
             rows.append([timestamp, name, "ok", ""])
         except Exception as e:
             reason = str(e).splitlines()[0]
             print(f"   [ERROR] {name}: {reason}")
             rows.append([timestamp, name, "error", reason])
 
+    # CSV 로그
     if args.csv:
-        log = outdir / "xla_export_log.csv"
-        with log.open("a", newline="") as f:
+        csv_path = outdir / "torch_mlir_log.csv"
+        with csv_path.open("a", newline="") as f:
             csv.writer(f).writerows(rows)
-        print(f"[✓] log appended → {log}")
+        print(f"[✓] log appended → {csv_path}")
 
 if __name__ == "__main__":
     main()

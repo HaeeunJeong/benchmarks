@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 try:
     from torch_mlir.fx import export_and_import
@@ -51,18 +52,78 @@ def make_inputs(dummy: Any):
 # ---------------------------------------------------------------------------
 # post‑export clean‑ups (optional)
 # ---------------------------------------------------------------------------
+from torch_mlir.compiler_utils import PassManager as pm
 from torch_mlir.compiler_utils import run_pipeline_with_repro_report
 
 def postprocess(mod):
-        # ① assert·shape 계산 제거
-    run_pipeline_with_repro_report(
-        mod,
-        "torch-drop-abstract-interp-calculations",
-    )
-    # ② canonicalize + stablehlo 정리 (상수 folding·중복 제거)
-    run_pipeline_with_repro_report(mod, "canonicalize", "canon")
-    run_pipeline_with_repro_report(mod, "stablehlo-aggressive-simplification", "shlo simp")
+    """Try to remove asserts / split big constants so lowering succeeds."""
+    try:
+        run_pipeline_with_repro_report(
+            mod, "torch-suppress-runtime-asserts", "suppress runtime assert")
+        run_pipeline_with_repro_report(
+            mod, "torch-split-large-constants", "split constants")
+    except Exception as e:
+        # Non‑fatal: just skip if pass unavailable
+        print(f"    (postprocess skipped: {e.splitlines()[0]})")
     return mod
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def _load_empty_hf(model_name: str):
+    """Load HF model **structure only**: no weights (uses meta device)."""
+    from transformers import AutoConfig, AutoModel
+    cfg = AutoConfig.from_pretrained(model_name)
+    mdl = AutoModel.from_config(cfg)
+    return mdl.to(torch.device("meta"))
+
+def _replace_leaf(mod, qname, obj, *, is_param):
+    parts, leaf = qname.split("."), qname.split(".")[-1]
+    tgt = mod
+    for p in parts[:-1]:
+        tgt = getattr(tgt, p)
+    if is_param:
+        tgt.register_parameter(leaf, torch.nn.Parameter(obj, requires_grad=False))
+    else:
+        tgt.register_buffer(leaf, obj)
+
+
+# def _replace_leaf(mod: torch.nn.Module, qual_name: str, obj, *, is_param: bool):
+#     """qual_name = 'layer1.0.weight' → 찾아가서 교체"""
+#     parts = qual_name.split(".")
+#     tgt_mod = mod
+#     for p in parts[:-1]:
+#         tgt_mod = getattr(tgt_mod, p)
+#     leaf = parts[-1]
+#     if is_param:
+#         tgt_mod.register_parameter(leaf, obj)
+#     else:
+#         tgt_mod.register_buffer(leaf, obj)
+
+def empty_parameters(m: torch.nn.Module):
+    """move every param/buffer to meta device (structure-only)."""
+    for n, p in list(m.named_parameters(recurse=True)):
+        meta_p = torch.empty_like(p, device="meta", requires_grad=p.requires_grad)
+        _replace_leaf(m, n, meta_p, is_param=True)
+    for n, b in list(m.named_buffers(recurse=True)):
+        meta_b = torch.empty_like(b, device="meta")
+        _replace_leaf(m, n, meta_b, is_param=False)
+    return m
+
+
+
+# def empty_parameters(m: torch.nn.Module):
+#     """Move all parameters/buffers to meta device to free RAM."""
+#     for n, p in list(m.named_parameters(recurse=True)):
+#         with torch.no_grad():
+#             new_p = torch.empty_like(p, device="meta")
+#             setattr(m, n, torch.nn.Parameter(new_p, requires_grad=p.requires_grad))
+#     for n, b in list(m.named_buffers(recurse=True)):
+#         new_b = torch.empty_like(b, device="meta")
+#         setattr(m, n, new_b)
+#     return m
+
 
 # ---------------------------------------------------------------------------
 # main
@@ -84,15 +145,21 @@ def main() -> None:
         try:
             print(f"[{name}] torch-mlir.fx export → stablehlo …")
             mdl, dummy = load_model(name); mdl.eval()
+
+            # ---- Remove parameter tensors to save memory ----
+            if isinstance(dummy, dict):  # HF LLM: load empty structure instead
+                mdl = _load_empty_hf(HF_MODELS[name]) if name in HF_MODELS else mdl
+            mdl = empty_parameters(mdl)
+
             if isinstance(dummy, dict):
                 mdl = HFPosWrapper(mdl)
 
-            shlo_mod = export_and_import(
-                mdl, *make_inputs(dummy), output_type=OutputType.STABLEHLO
-            )
-            # postprocess(shlo_mod)
+            with FakeTensorMode():
+                shlo_mod = export_and_import(
+                    mdl, *make_inputs(dummy), output_type=OutputType.STABLEHLO
+                )
 
-            # print(shlo_mod)
+            postprocess(shlo_mod)
 
             out = outdir / f"{name}_stablehlo.mlir"
             out.write_text(str(shlo_mod))
