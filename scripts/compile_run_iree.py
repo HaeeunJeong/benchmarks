@@ -64,6 +64,7 @@ def export_and_externalize(model: torch.nn.Module, inputs):
     # 2) 외부화
     aot.externalize_module_parameters(model)
     exported = aot.export(model, *inputs)
+    # print(exported)
     return exported, weights
 
 
@@ -140,6 +141,9 @@ def main():
             # vmfb_mm_for_save = exported.compile(save_to=f"{mdl_dir}/{name}-{args.backend}.vmfb", target_backends=[args.backend])
             vmfb_mm = exported.compile(save_to=None, target_backends=[args.backend])
             # print(f"  ✓ saved weights to {safepath}")
+
+            # from torch_mlir.compiler_utils import run_pipeline_with_repro_report
+            # run_pipeline_with_repro_report(vmfb_mm, "print-ir-after-all", "print-ir")
 
             st = time.perf_counter(); run_vmfb(vmfb_mm, args.backend, inp, weight_dict); lat = (time.perf_counter()-st)*1000
             (mdl_dir / "latency.txt").write_text(f"{lat:.3f} ms\n")

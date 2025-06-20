@@ -71,12 +71,12 @@ def run_one(model: torch.nn.Module, dummy: Any, *, device: str) -> float:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model", nargs="*", help="model keys; omit for ALL")
-    ap.add_argument("--device", default="xla", help="xm.xla_device() spec, e.g. 'xla', 'xla:1'")
+    ap.add_argument("--device", default="xla:1", help="xm.xla_device() spec, e.g. 'xla', 'xla:1'")
     ap.add_argument("--csv", action="store_true", help="write results/xla_latency_*.csv")
     args = ap.parse_args()
 
     models = args.model if args.model else ALL_MODELS
-    device = xm.xla_device() if args.device == "xla" else torch.device(args.device)
+    device = xm.xla_device() if args.device == "xla:1" else torch.device(args.device)
     out_rows: list[list[str]] = []
     ts = datetime.now().isoformat(timespec="seconds")
 

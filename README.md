@@ -9,28 +9,38 @@ A **reproducible micro‑benchmark suite** for testing how common PyTorch models
 ```text
 benchmarks/
 ├── env/                      # Pre‑baked Conda env specs (pick one)
+│   ├── iree-cpu/             # IREE CPU
 │   ├── torch-mlir/           # PyTorch to StableHLO through torch-mlir (for both CPU and CUDA)
-│   │   ├── environment.yaml
-│   │   └── requirements.txt
 │   ├── torch-xla/            # PyTorch to StableHLO through torch-xla (for CPU)
-│   │   ├── environment.yaml
-│   │   └── requirements.txt
-│   ├── stablehlo-iree/       # StableHLO to IREE
-│   │   ├── environment.yaml
-│   │   └── requirements.txt
-├── models/                   # Lightweight model stubs (Conv, GAT …)
+│   └── stablehlo-iree/       # StableHLO to IREE
+├── models/                   # Model wrappers - get_model(), get_dummy_input()
 │   ├── conv_block.py
+│   ├── mobilenet_block.py
+│   ├── bert_block.py
+│   ├── vit_block.py
+│   ├── gpt2_block.py
+│   ├── llama_block.py
+│   ├── deepseek_block.py
 │   ├── gcn_block.py
 │   ├── graphsage_block.py
 │   ├── gat_block.py
 │   └── gatv2_block.py
-├── scripts/                  # All entry‑point helpers
-│   ├── run_bench.py          # Pure‑PyTorch latency probe
-│   ├── run_bench_memgraph.py
-│   ├── torch_xla_stablehlo.py
-│   ├── torch_mlir_stablehlo.py
-│   └── compile_iree.py       # not working currently
-└── results/                  # *.vmfb, *.csv outputs are dropped here
+├── scripts/                        # All entry‑point helpers
+│   ├── run_bench.py                # Pure‑PyTorch latency probe
+│   ├── run_bench_memgraph.py       # Memory Graph
+│   ├── export_torch_mlir_stablehlo # export StableHLO through torch-mlir 
+│   ├── export_torch_xla_stablehlo  # export StableHLO through torch-xla 
+│   ├── compile_run_xla.py          # PyTorch -> StableHLO -> XLA
+│   ├── compile_run_iree.py         # PyTorch -> Linalg -> IREE
+│   └── ireeflow
+│       ├── save_mlir_and_params.py          # Save Torch Dialect MLIR and Parameters
+│       ├── compile_vmfb.py                  # Compile to VMFB
+│       ├── run_model.py                     # Run - TODO: Accuracy Comparison
+│       ├── measure_run.py                   # Latency Measurement
+│       ├── cuda_compile_vmfb.py             # Compile to VMFB (CUDA Ver.)
+│       ├── cuda_run_model.py                # Run (CUDA Ver.) - TODO: Accuracy Comparison
+│       └── cuda_measure_run.py              # Latency Measurement (CUDA Ver.)
+└── results/                        # *.vmfb, *.csv outputs are dropped here
 ```
 
 ---
@@ -138,5 +148,3 @@ $ python -m scripts.compile_iree resnet mobilenet --target cuda
 ## 📜 License / visibility
 
 This is a **private** research benchmark. Do **NOT** publish benchmark numbers externally without permission.
-
-
