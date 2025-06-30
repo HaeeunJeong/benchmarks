@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 import argparse, pathlib, sys, iree.compiler.tools as irec
-# sys.path.append(str(pathlib.Path('models').resolve().parent))
 
 ROOT      = pathlib.Path(__file__).parent
-print(f"ROOT: {ROOT}")
 OUT_MLIR  = ROOT / "../../results/iree-output" / "mlir"
-print(f"OUT_MLIR: {OUT_MLIR}")
-OUT_VMFB  = ROOT / "../../results/iree-output" / "vmfb"
+OUT_VMFB  = ROOT / "../../results/iree-output" / "vmfb-cuda"
 OUT_VMFB.mkdir(parents=True, exist_ok=True)
+
+CUDA_ARCH= "sm_89"
 
 def discover():  # *_block.mlir
     return sorted(p.stem for p in OUT_MLIR.glob("*_block.mlir"))
@@ -19,13 +18,16 @@ def compile_one(name: str):
         return
     try:
         vmfb = irec.compile_str(mlir_f.read_text(),
-                            target_backends=["llvm-cpu"],
+                            target_backends=["cuda"],
                             input_type="torch",
                             extra_args=[
-                                "--iree-llvmcpu-target-cpu-features=host",
                                 "--iree-torch-decompose-complex-ops",
                                 "--iree-torch-use-strict-symbolic-shapes",
-                                f"--iree-opt-level=O{1}"
+                                "--iree-opt-level=O3",
+                                "--iree-hal-target-device=cuda",
+                                # f"--iree-cuda-target={CUDA_ARCH}",
+                                "--iree-cuda-use-ptxas",
+                                "--iree-cuda-target-features=+ptx86",
                             ],
                             # output_format="vmfb"
                             )

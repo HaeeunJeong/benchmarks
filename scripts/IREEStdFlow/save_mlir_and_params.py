@@ -4,10 +4,12 @@ from safetensors.torch import save_file
 import iree.turbine.aot as aot
 
 import sys
+# print(sys.path)
 sys.path.append(str(pathlib.Path('models').resolve().parent))
+# print(sys.path)
 
 ROOT        = pathlib.Path(__file__).parent
-print(f"ROOT: {ROOT}")
+# print(f"ROOT: {ROOT}")
 MODELS_DIR  = ROOT / "../../models"
 OUT_PARAMS  = ROOT / "../../results/iree-output" / "params"
 OUT_MLIR    = ROOT / "../../results/iree-output" / "mlir"
@@ -41,6 +43,42 @@ def process(mname: str):
     dummy   = _tensorize(mod.get_dummy_input())
     tensors = _flatten(dummy)
     aot.export(model,*tensors).save_mlir(OUT_MLIR / f"{mname}.mlir")
+
+    from torch_mlir.fx import export_and_import, _module_lowering, ir
+    from torch_mlir.dialects import torch as torch_d
+    from torch_mlir.extras.fx_importer import FxImporter, FxImporterHooks
+    from torch_mlir.compiler_utils import OutputType, lower_mlir_module
+    torch_dialect = aot.export(model,*tensors).mlir_module
+
+    hooks = None
+    context = ir.Context()
+    torch_d.register_dialect(context)
+    fx_importer = FxImporter(context=context, hooks=hooks)
+
+    # fx_importer.import_program(
+    #     torch_dialect,
+    #     func_name="main",
+    #     import_symbolic_shape_expressions=True,
+    # )
+    #
+    verbose = True
+    enable_ir_printing = False
+    # print("_modle_lowering: export_and_import")
+    # shlod = _module_lowering(verbose, enable_ir_printing, OutputType.STABLEHLO, fx_importer.module, None)
+    # shlo_dialect = lower_mlir_module(verbose, OutputType.STABLEHLO, torch_dialect)
+
+    from torch_mlir.compiler_utils import run_pipeline_with_repro_report
+    run_pipeline_with_repro_report(
+        torch_dialect,
+        "builtin.module(torch-backend-to-stablehlo-backend-pipeline)",
+        "Lowering Torch Backend IR -> StableHLO Backend IR",
+    )
+
+
+    out = OUT_MLIR / f"{mname}_shlo.mlir"
+    out.write_text(str(shlo_dialect))
+    print(f"✓ [{mname}] stablehlo 저장")
+
 
     # 3) inputs
     np.savez(OUT_INPUT / f"{mname}.npz",
