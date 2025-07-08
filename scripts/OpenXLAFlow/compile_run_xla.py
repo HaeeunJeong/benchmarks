@@ -14,7 +14,7 @@ $ python -m scripts.compile_xla             # all models, default xla:cpu
 """
 from __future__ import annotations
 
-import argparse, csv, os, time
+import argparse, csv, os, time, sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,11 +23,28 @@ import torch
 import torch_xla
 import torch_xla.core.xla_model as xm
 
+
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent))  # add parent to PYTHONPATH
+sys.path.append(str(Path(__file__).resolve().parent.parent))  # add scripts to PYTHONPATH
+
 from scripts.run_bench import load_model, ALL_MODELS
+
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+print(f"ROOT_DIR: {ROOT_DIR}")
+MODEL_DIR   = ROOT_DIR / "models"
+UTIL_DIR    = ROOT_DIR / "utils"
+RESULTS_DIR = ROOT_DIR / "results" / "xla"
+
+OUT_DIR = RESULTS_DIR / "xla_out"
+
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+def _init_dir(model: str) -> None:
+    for d in (RESULTS_DIR, OUT_DIR):
+        d.mkdir(parents=True, exist_ok=True)
 
 def make_inputs(dummy: Any, device):
     if isinstance(dummy, tuple):

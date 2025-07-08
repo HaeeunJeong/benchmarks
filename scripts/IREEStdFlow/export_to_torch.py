@@ -28,7 +28,8 @@ def _tensorize(d):  # tuple→rand tensor
     return d
     # return torch.randn(d) if isinstance(d, tuple) else d
 def _flatten(x):
-    return sum((_flatten(e) if isinstance(x, (tuple, list)) else [x] for e in (x if isinstance(x,(tuple,list)) else [x])), [])
+    return sum((_flatten(e) if isinstance(x, (tuple, list)) 
+        else [x] for e in (x if isinstance(x,(tuple,list)) else [x])), [])
 
 def process(mname: str):
     mod   = importlib.import_module(f"models.{mname}")
@@ -44,40 +45,8 @@ def process(mname: str):
     tensors = _flatten(dummy)
     aot.export(model,*tensors).save_mlir(OUT_MLIR / f"{mname}.mlir")
 
-    from torch_mlir.fx import export_and_import, _module_lowering, ir
-    from torch_mlir.dialects import torch as torch_d
-    from torch_mlir.extras.fx_importer import FxImporter, FxImporterHooks
-    from torch_mlir.compiler_utils import OutputType, lower_mlir_module
-    torch_dialect = aot.export(model,*tensors).mlir_module
-
-    hooks = None
-    context = ir.Context()
-    torch_d.register_dialect(context)
-    fx_importer = FxImporter(context=context, hooks=hooks)
-
-    # fx_importer.import_program(
-    #     torch_dialect,
-    #     func_name="main",
-    #     import_symbolic_shape_expressions=True,
-    # )
-    #
-    verbose = True
-    enable_ir_printing = False
-    # print("_modle_lowering: export_and_import")
-    # shlod = _module_lowering(verbose, enable_ir_printing, OutputType.STABLEHLO, fx_importer.module, None)
-    # shlo_dialect = lower_mlir_module(verbose, OutputType.STABLEHLO, torch_dialect)
-
-    from torch_mlir.compiler_utils import run_pipeline_with_repro_report
-    run_pipeline_with_repro_report(
-        torch_dialect,
-        "builtin.module(torch-backend-to-stablehlo-backend-pipeline)",
-        "Lowering Torch Backend IR -> StableHLO Backend IR",
-    )
 
 
-    out = OUT_MLIR / f"{mname}_shlo.mlir"
-    out.write_text(str(shlo_dialect))
-    print(f"✓ [{mname}] stablehlo 저장")
 
 
     # 3) inputs

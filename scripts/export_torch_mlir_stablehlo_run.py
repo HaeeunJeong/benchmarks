@@ -25,7 +25,7 @@ import iree.runtime as ireert
 import iree.runtime as rt
 from iree.compiler import compile_str, CompilerOptions, InputType, OutputFormat
 
-from scripts.run_bench import load_model, ALL_MODELS
+from run_bench import load_model, ALL_MODELS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,8 +151,9 @@ def main():
     args = p.parse_args()
 
     models = args.model or ALL_MODELS
-    results_root = Path("results/iree"); results_root.mkdir(exist_ok=True)
-    compile_root = Path("results/compile_iree"); compile_root.mkdir(exist_ok=True)
+    ROOT_DIR = Path(__file__).resolve().parent.parent
+    RESULTS_DIR = ROOT_DIR / "results" / "iree-shlo-flow"
+    RESULTS_DIR.mkdir(exist_ok=True, parents=True)
 
     rows, ts = [], datetime.now().isoformat(timespec="seconds")
 
@@ -170,8 +171,8 @@ def main():
             # print(f"exported: {exported}")
             # print(f"weights: {weights}")
 
-            mdl_out = results_root / name; mdl_out.mkdir(exist_ok=True)
-            cmp_out = compile_root / name / args.backend
+            mdl_out = RESULTS_DIR / name; mdl_out.mkdir(exist_ok=True)
+            cmp_out =  mdl_out / args.backend
             cmp_out.mkdir(parents=True, exist_ok=True)
 
             if weights:
@@ -196,14 +197,14 @@ def main():
 
         except Exception as e:
             reason = str(e).splitlines()[0]
-            cmp_out.mkdir(parents=True, exist_ok=True)
-            (cmp_out / "error_trace.txt").write_text(traceback.format_exc())
+            # cmp_out.mkdir(parents=True, exist_ok=True)
+            (RESULTS_DIR / "error_trace.txt").write_text(traceback.format_exc())
             print(f"  [ERROR] {name}: {reason}")
             rows.append([ts, name, args.backend, f"error: {reason}"])
 
     if args.csv:
         tag = "all" if not args.model else "_".join(args.model)
-        csv_p = results_root / f"iree_latency_{tag}_{args.backend}.csv"
+        csv_p = RESULTS_DIR / f"iree_latency_{tag}_{args.backend}.csv"
         with csv_p.open("a", newline="") as f:
             csv.writer(f).writerows(rows)
         print(f"[✓] CSV → {csv_p}")

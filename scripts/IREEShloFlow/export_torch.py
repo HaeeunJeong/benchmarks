@@ -84,7 +84,7 @@ def _flatten(x):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("model", nargs="*", help="model keys; empty = ALL")
+    ap.add_argument("model", nargs="*", hlp="model keys; empty = ALL")
     ap.add_argument("--outdir", default="results/torch-mlir", help="output directory")
     ap.add_argument("--csv", action="store_true")
     args = ap.parse_args()

@@ -9,77 +9,85 @@ import numpy as np
 import safetensors.numpy as stnp
 import iree.runtime as ireert
 
+from typing import List
+
 import sys
-sys.path.append(str(pathlib.Path('models').resolve().parent))
+# sys.path.append(str(pathlib.Path('models').resolve().parent))
 
-ROOT        = pathlib.Path(__file__).parent
-OUT_PARAMS  = ROOT / "../../results/iree-output" / "params"
-OUT_INPUT   = ROOT / "../../results/iree-output" / "input"
-OUT_VMFB    = ROOT / "../../results/iree-output" / "vmfb"
-OUT_CSV     = ROOT / "../../results/iree-output" / "latency.csv"   # ← 결과 CSV
+ROOT_DIR    = pathlib.Path(__file__).resolve().parent.parent
+MODEL_DIR   = ROOT_DIR / "models"
 
+RESULTS_DIR = ROOT_DIR / "results" / "ireeflow"
+PARAM_DIR   = RESULTS_DIR / "params"
+INPUT_DIR   = RESULTS_DIR / "inputs"
+VMFB_DIR    = RESULTS_DIR / "vmfb"
+
+sys.path.append(str(ROOT_DIR))
 # ──────────────────────────────────────────────────────────────────────────────
 # Util
 # ──────────────────────────────────────────────────────────────────────────────
-def discover():
-    """output/params 하위에서 모델 이름 자동 검색"""
-    return sorted(p.stem.replace(".safetensors", "")
-                  for p in OUT_PARAMS.glob("*_block.safetensors"))
+# def discover():
+#     """output/params 하위에서 모델 이름 자동 검색"""
+#     return sorted(p.stem.replace(".safetensors", "")
+#                   for p in OUT_PARAMS.glob("*_block.safetensors"))
+
+def available_models(driver: str) -> List[str]:
+    pattern = ""
+
+    if driver == "local-sync" or driver == "local-task":
+        pattern = "*-llvm-cpu.vmfb"
+    elif driver == "cuda":
+        pattern = "*-cuda.vmfb"
+
+    return sorted(p.stem.rsplit("-", 1)[0] 
+        for p in VMFB_DIR.glob(pattern))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Core
 # ──────────────────────────────────────────────────────────────────────────────
 def run_one(name: str, driver: str, warmup: int, iters: int):
-    reqs = [OUT_PARAMS / f"{name}.safetensors",
-            OUT_VMFB   / f"{name}.vmfb",
-            OUT_INPUT  / f"{name}.npz"]
+    if driver == "cuda": vmfb_name = f"{name}-cuda" 
+    else: vmfb_name = f"{name}-llvm-cpu"
+
+    reqs = [PARAM_DIR / f"{name}.safetensors",
+            VMFB_DIR   / f"{vmfb_name}.vmfb",
+            INPUT_DIR  / f"{name}.npz"]
     if not all(f.exists() for f in reqs):
-        print(f"[{name}] 필요한 파일이 없습니다 → {reqs}")
+        print(f"[{name}] Files are not found → {reqs}")
         return
 
-    # 1) 런타임 초기화
+    # 1) Init IREE runtime
     config = ireert.Config(driver_name=driver)
     instance = config.vm_instance
 
-    # 2) 파라미터 인덱스 작성 (safetensors → const buffer)
+    # 2) Parameter indexing (safetensors → const buffer)
     idx = ireert.ParameterIndex()
     for k, v in stnp.load_file(reqs[0]).items():
         idx.add_buffer(k, v.tobytes())
 
 
+    # 3) Load vm_modules
     param_module = ireert.create_io_parameters_module(
         instance, idx.create_provider(scope="model")
     )
-
-    # binary = str(reqs[1])
-
-    # 3) VM 모듈 묶음 생성
-    # modules = ireert.load_vm_modules(
-    #     ireert.create_io_parameters_module(inst, idx.create_provider(scope="model")),
-    #     ireert.create_hal_module(inst, cfg.device),
-    #     ireert.VmModule.mmap(inst, str(reqs[1])),
-    #     config=cfg
-    # )
-    # main = modules[-1].main
+    hal_module = ireert.create_hal_module(instance, config.device)
+    vm_module = ireert.VmModule.mmap(instance, str(reqs[1]))
 
     vm_modules = ireert.load_vm_modules(
-        param_module,
-        ireert.create_hal_module(instance, config.device),
-        # ireert.VmModule.copy_buffer(instance, binary.map_memory()),
-        ireert.VmModule.mmap(instance, str(reqs[1])),
+        param_module, hal_module, vm_module,
         config=config,
     )
     main = vm_modules[-1].main
 
-    # 4) 입력 로드
+    # 4) Load inputs
     npz  = np.load(reqs[2])
     args = [npz[k] for k in sorted(npz.files)]
 
-    # 5) 워밍업
+    # 5) warmup
     for _ in range(warmup):
         main(*args)
 
-    # 6) 순수 실행 시간 측정
+    # 6) Measure execution time
     dur_ms = []
     for _ in range(iters):
         t0 = time.perf_counter()
@@ -97,12 +105,12 @@ def run_one(name: str, driver: str, warmup: int, iters: int):
           f"min {min_ms:7.3f} ms | N={iters}")
 
     # 7) CSV 저장 --------------------------------------------------------------
-    OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
-    with OUT_CSV.open("a", newline="") as f:
+    out_csv = RESULTS_DIR / "ireeflow.csv"
+    with out_csv.open("a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
             datetime.datetime.now().isoformat(timespec="seconds"),
-            name, driver, "CPU", warmup, iters,
+            name, driver, warmup, iters,
             f"{mean_ms:.3f}", f"{median_ms:.3f}",
             f"{min_ms:.3f}", f"{max_ms:.3f}"
         ])
@@ -117,14 +125,14 @@ if __name__ == "__main__":
     ap.add_argument("model_name", nargs="?",
                     help="측정할 모델 이름(생략 시 output/params/* 자동 검색)")
     ap.add_argument("--driver", default="local-sync",
-                    help="IREE 드라이버 (예: local-sync, cuda-sync, vulkan-sync)")
+                    help="IREE 드라이버 (예: local-sync, local-task, cuda)")
     ap.add_argument("--warmup", type=int, default=5,
                     help="워밍업 실행 횟수")
     ap.add_argument("--iters", type=int, default=10,
                     help="측정 반복 횟수")
     args = ap.parse_args()
 
-    names = [args.model_name] if args.model_name else discover()
+    names = [args.model_name] if args.model_name else available_models(args.driver)
     for n in names:
         run_one(n, args.driver, args.warmup, args.iters)
 
